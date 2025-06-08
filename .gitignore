@@ -1,0 +1,13 @@
+# Android / IntelliJ
+/.idea/
+/build/
+/app/build/
+/*.iml
+
+# Rust
+/target/
+/**/*.rs.bk
+Cargo.lock
+
+# OS cruft
+.DS_Store
