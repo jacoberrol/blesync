@@ -34,6 +34,9 @@ pub enum BleError {
 
     #[error("BLE operation failed: {0}")]
     Api(#[from] btleplug::Error),
+
+    #[error("Session ended (peripheral disconnected or adapter lost)")]
+    SessionEnded,
 }
 
 /// A single object that owns our BLE state.
@@ -208,7 +211,10 @@ impl BleCentral {
                                 }
                             }
                         },
-                        None => {/* no notifications */},
+                        None => {
+                            warn!("Notification returned None.");
+                            return Err(BleError::SessionEnded);
+                        },
                     }
                 },
 
@@ -219,17 +225,16 @@ impl BleCentral {
                         }
                         Ok(false) => {
                             warn!("Detected peripheral disconnect.");
-                            break 'session;
+                            return Err(BleError::SessionEnded);
                         }
                         Err(e) => {
-                            error!("Error checking connection state: {}",e);
-                            break 'session;
+                            warn!("Error checking connection state: {}",e);
+                            return Err(BleError::SessionEnded);
                         }
                     }
                 }
             };
         }
-        Ok(())
     }
 
     /// High‐level reconnect loop
