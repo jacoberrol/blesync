@@ -17,7 +17,8 @@ use tracing_subscriber::{fmt, EnvFilter};
         // Create the BleCentral
         let mut ble = BleCentral::new(
             "9835D696-923D-44CA-A5EA-D252AE3297B9",
-            "7AB61943-BBB5-49D6-88C8-96185A98E587"
+            "7AB61943-BBB5-49D6-88C8-96185A98E587",
+            None
         ).await.expect("Initialization failed");
         
         let shutdown = tokio::signal::ctrl_c();

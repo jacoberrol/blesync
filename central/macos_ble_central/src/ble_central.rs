@@ -7,15 +7,26 @@ use tokio::time::{sleep, timeout, Duration};
 use uuid::Uuid;
 use tracing::{debug, error, info, instrument, warn /*trace*/};
 
-macro_rules! ensure_ble {
-    ($cond:expr, $err:expr) => {
-        if !($cond) {
-            return Err($err);
-        }
-    };
+
+#[derive(Debug)]
+pub struct BleConfig {
+    pub scan_retries:     u32,
+    pub scan_interval:    Duration,
+    pub notify_timeout:   Duration,
+    pub reconnect_backoff: Duration,
 }
 
-/// A single object that owns our BLE state.
+impl Default for BleConfig {
+    fn default() -> Self {
+        BleConfig {
+            scan_retries:      30,
+            scan_interval:     Duration::from_secs(1),
+            notify_timeout:    Duration::from_secs(10),
+            reconnect_backoff: Duration::from_secs(5),
+        }
+    }
+}
+
 pub struct BleCentral {
     manager: Option<Manager>,               // the BLE Manager, once instantiated
     adapter: Option<Adapter>,               // the BLE adapter, once instantiated
@@ -23,16 +34,13 @@ pub struct BleCentral {
     characteristic: Option<Characteristic>, // the discovered characteristic, once found
     service_uuid: Uuid,                     // the service UUID to discover
     char_uuid: Uuid,                        // the characteristic UUID to discover
-    peripheral_scan_retries: u16,
-    peripheral_scan_sleep: u16,
-    notification_timeout: u16,
-    reconnect_timeout: u16,
+    config: BleConfig,
 }
 
 impl BleCentral {
     
     /// Construct and initialize logging + BLE manager + adapter
-    pub async fn new(service: &str, characteristic: &str) -> Result<Self, BleError> {
+    pub async fn new(service: &str, characteristic: &str, config: Option<BleConfig>) -> Result<Self, BleError> {
         info!("Constructing BLE Central.");
         /*
         * Step 1: Parse the UUIDs
@@ -47,10 +55,7 @@ impl BleCentral {
             characteristic: None,
             service_uuid: Uuid::parse_str(service)?,
             char_uuid: Uuid::parse_str(characteristic)?,
-            peripheral_scan_retries: 30u16,
-            peripheral_scan_sleep: 1u16,
-            notification_timeout: 10u16,
-            reconnect_timeout: 5u16
+            config: config.unwrap_or_default(),
         })
     }
 
@@ -80,7 +85,9 @@ impl BleCentral {
     async fn scan_and_select(&mut self) -> Result<(), BleError> {
         info!("Scanning for peripheral.");
 
-        ensure_ble!( self.adapter.is_some(), BleError::NoAdapter);
+        let adapt = self.adapter
+            .as_ref()
+            .ok_or(BleError::NoAdapter)?;
 
         /*
         * Step 3: Start scanning for peripherals advertising our service UUID
@@ -88,7 +95,7 @@ impl BleCentral {
         * - adapter.start_scan triggers the OS BLE scan.
         */
         let filter = ScanFilter { services: vec![self.service_uuid], ..Default::default() };        
-        let adapt = self.adapter.as_ref().unwrap();
+        
         adapt.start_scan(filter).await?;
         debug!("Started Scanning for BLE peripheral…");
 
@@ -99,7 +106,7 @@ impl BleCentral {
         * - p.properties().await fetches advertisement metadata including services.
         * - We compare the advertised services list to our target UUID.
         */
-        'scan: for _ in 0..self.peripheral_scan_retries {
+        'scan: for _ in 0..self.config.scan_retries {
             let list = adapt.peripherals().await?;
             for p in &list {
                 // Perform the async properties() call outside of a closure
@@ -113,13 +120,15 @@ impl BleCentral {
             }
             // sleep for 1s before trying again
             debug!("no peripheral found. sleep and retry");
-            sleep(Duration::from_secs(self.peripheral_scan_sleep as u64)).await;
+            sleep(self.config.scan_interval).await;
         }
 
         adapt.stop_scan().await?;
         debug!("Stopped scanning.");
 
-        ensure_ble!(self.peripheral.is_some(), BleError::NoPeripheral);
+        self.peripheral
+            .as_ref()
+            .ok_or(BleError::NoPeripheral)?;
         
         Ok(())
 
@@ -130,9 +139,10 @@ impl BleCentral {
     async fn connect_and_discover(&mut self) -> Result<(), BleError> {
         info!("Connecting to peripheral and discovering services.");
         
-        ensure_ble!(self.peripheral.is_some(), BleError::NoPeripheral);
-
-        let periph = self.peripheral.as_ref().unwrap();
+        let periph = self.peripheral
+            .as_ref()
+            .ok_or(BleError::NoPeripheral)
+            .unwrap();
 
         /*
         * Step 5: Connect to the peripheral and discover its services
@@ -163,12 +173,14 @@ impl BleCentral {
     async fn run_session(&mut self) -> Result<(), BleError> {
         info!("Starting session.");
 
-        ensure_ble!(self.peripheral.is_some(), BleError::NoPeripheral);
-        ensure_ble!(self.characteristic.is_some(), BleError::NoCharacteristic(self.char_uuid));
-
         // proceed only if we have a reference to the peripheral
-        let periph = self.peripheral.as_ref().unwrap();
-        let tx_char = self.characteristic.as_ref().unwrap();
+        let periph = self.peripheral
+            .as_ref()
+            .ok_or(BleError::NoPeripheral)?;
+
+        let tx_char = self.characteristic
+            .as_ref()
+            .ok_or(BleError::NoCharacteristic(self.char_uuid))?;
 
         /*
         * Step 7: Subscribe to notifications on that characteristic
@@ -188,7 +200,7 @@ impl BleCentral {
         */
         debug!("Listening for JSON notifications…");
         loop {
-            match timeout(Duration::from_secs(self.notification_timeout as u64),notifications.next()).await {
+            match timeout(self.config.notify_timeout,notifications.next()).await {
                 Ok(Some(n)) => {
                     if n.uuid == self.char_uuid {
                         let text = String::from_utf8_lossy(&n.value);
@@ -214,19 +226,19 @@ impl BleCentral {
             // 1) Recreate Adapter
             if let Err(e) = self.recreate_adapter().await {
                 warn!("Failed to get adapter: {} — retrying in 5s", e);
-                sleep(Duration::from_secs(self.reconnect_timeout as u64)).await;
+                sleep(self.config.reconnect_backoff).await;
                 continue;
             }
             // 2) Scan & select
             if let Err(e) = self.scan_and_select().await {
                 warn!("Scan failed: {} — retrying in 5s…", e);
-                sleep(Duration::from_secs(self.reconnect_timeout as u64)).await;
+                sleep(self.config.reconnect_backoff).await;
                 continue;
             }
             // 3) Connect & discover
             if let Err(e) = self.connect_and_discover().await {
                 warn!("Discover failed: {} — retrying in 5s…", e);
-                sleep(Duration::from_secs(self.reconnect_timeout as u64)).await;
+                sleep(self.config.reconnect_backoff).await;
                 continue;
             }
             // 4) Run session
@@ -235,7 +247,7 @@ impl BleCentral {
                 // drop old peripheral & characteristic
                 self.peripheral = None;
                 self.characteristic = None;
-                sleep(Duration::from_secs(self.reconnect_timeout as u64)).await;
+                sleep(self.config.reconnect_backoff).await;
                 continue;
             }
             // if run_session() ever returns Ok, we exit the loop
