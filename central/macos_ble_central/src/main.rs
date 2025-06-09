@@ -2,7 +2,7 @@ use btleplug::api::{Central, Characteristic, Manager as _, Peripheral as _, Scan
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::stream::StreamExt;
 use serde_json::Value;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use uuid::Uuid;
 use log::{error, warn, info, debug, /*trace*/};
 // use thiserror::Error;
@@ -126,6 +126,7 @@ impl BleCentral {
                 }
             }
             // sleep for 1s before trying again
+            debug!("no peripheral found. sleep and retry");
             sleep(Duration::from_secs(1)).await;
         }
 
@@ -198,42 +199,23 @@ impl BleCentral {
         * - We convert it to UTF-8, then parse as JSON using serde_json.
         */
         debug!("Listening for JSON notifications…");
-        'session: loop {
-            tokio::select! {
-                notif = notifications.next() => {
-                    match notif {
-                        Some(n) => {
-                            if n.uuid == self.char_uuid {
-                                let text = String::from_utf8_lossy(&n.value);
-                                match serde_json::from_str::<Value>(&text) {
-                                    Ok(json) => info!("→ {}", json),
-                                    Err(e)   => error!("JSON parse error: {}", e),
-                                }
-                            }
-                        },
-                        None => {
-                            warn!("Notification returned None.");
-                            return Err(BleError::SessionEnded);
-                        },
+        loop {
+            match timeout(Duration::from_secs(10),notifications.next()).await {
+                Ok(Some(n)) => {
+                    if n.uuid == self.char_uuid {
+                        let text = String::from_utf8_lossy(&n.value);
+                        match serde_json::from_str::<Value>(&text) {
+                            Ok(json) => info!("→ {}", json),
+                            Err(e)   => error!("JSON parse error: {}", e),
+                        }
                     }
                 },
-
-                _ = sleep(Duration::from_secs(10)) => {
-                    match periph.is_connected().await {
-                        Ok(true) => {
-                            continue 'session;
-                        }
-                        Ok(false) => {
-                            warn!("Detected peripheral disconnect.");
-                            return Err(BleError::SessionEnded);
-                        }
-                        Err(e) => {
-                            warn!("Error checking connection state: {}",e);
-                            return Err(BleError::SessionEnded);
-                        }
-                    }
-                }
-            };
+                _ => {
+                    // covers Ok(None) (stream ended), Err(_) (timeout), or any error
+                    warn!("Notifications stopped or timed out; disconnecting");
+                    return Err(BleError::SessionEnded);
+                },
+            }
         }
     }
 
@@ -273,18 +255,31 @@ impl BleCentral {
         }
     }
 
+    async fn shutdown(&mut self) {
+        info!("Shutting down BLE.");
+        if let Some(per) = &self.peripheral {
+            if let Some(tx_char) = &self.characteristic {
+                let _ = per.unsubscribe(tx_char);
+                debug!("Unsubscribed");
+            }
+            let _ = per.disconnect();
+            debug!("Disconnected");
+            debug!("Performed shutdown cleanup");
+        }
+    }
+
 }
 
 
 #[tokio::main]
     async fn main() {
 
-        // initialize logger with default level "info"
+        // initialize logger with default level "debug"
         env_logger::Builder::from_env(
             env_logger::Env::default().default_filter_or("debug")
         ).init();
         
-        // Create the single owner for all BLE state
+        // Create the BleCentral
         let mut ble = BleCentral::new(
             "9835D696-923D-44CA-A5EA-D252AE3297B9",
             "7AB61943-BBB5-49D6-88C8-96185A98E587"
@@ -294,20 +289,13 @@ impl BleCentral {
         let runner  = ble.run();
 
         tokio::select! {
-            _ = runner => {
+            _ = runner => {                
                 error!("BLE loop exited unexpectedly; shutting down");
+                ble.shutdown().await;
             }
             _ = shutdown => {
                 info!("Ctrl-C received; shutting down");
-                if let Some(per) = &ble.peripheral {
-                    if let Some(tx_char) = &ble.characteristic {
-                        let _ = per.unsubscribe(tx_char);
-                        debug!("Unsubscribed");
-                    }
-                    let _ = per.disconnect();
-                    debug!("Disconnected");
-                    debug!("Performed shutdown cleanup");
-                }
+                ble.shutdown().await;
             }
         }
 
